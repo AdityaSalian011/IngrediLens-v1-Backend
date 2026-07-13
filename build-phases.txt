@@ -1,0 +1,71 @@
+Phased Build Plan
+Phase 1 — Core (get this working first)
+
+Text input → hair type HITL → classification output
+Phase 2 — Vision
+
+Image upload → extract ingredients via Claude vision → feed into Phase 1
+Phase 3 — Web Search
+
+Attach EWG search tool for unknown ingredients
+Phase 4 — Memory + Chat
+
+"Is Sodium Lauryl Sulfate worse than SLES for dry hair?" follow-up questions
+Phase 5 — Deploy
+
+HuggingFace Spaces, clean UI, shareable link for resume
+
+# Nodes you'll build:
+1. extract_ingredients   # vision or text parsing
+2. ask_hair_profile      # HITL interrupt — collect hair type + concerns
+3. search_ingredient     # tool node — EWG web search for unknowns  
+4. classify_ingredients  # structured output per ingredient
+5. summarize             # final recommendation + what to avoid
+
+# Edges:
+START → extract_ingredients
+extract_ingredients → ask_hair_profile (interrupt)
+ask_hair_profile → classify_ingredients
+classify_ingredients → search_ingredient (conditional, if unknown)
+search_ingredient → classify_ingredients (loop back)
+classify_ingredients → summarize → END
+
+[Analysis Node]
+     │
+     ├──► Known ingredient → LLM classifies directly
+     │
+     └──► Unknown ingredient → Web Search Tool → EWG / PubMed → then classify
+
+MCP Integration — Yes, There's a Perfect Fit
+Web Search MCP is ideal here. Here's why:
+Pure LLM knowledge about ingredients can be outdated or hallucinated. But if you attach a web search tool as a LangGraph node, the agent can:
+
+Search EWG Skin Deep database (ewg.org/skindeep) — the gold standard for cosmetic ingredient safety ratings
+Look up any unfamiliar/novel ingredient in real time
+Cite a source for each classification → builds user trust
+
+User Input (Image / Text)
+        │
+        ▼
+[Image?] ──Yes──► Vision Node (extract ingredient list via Claude vision)
+        │
+        No
+        │
+        ▼
+[HITL Node] ◄──── LangGraph interrupt()
+  Ask: hair type, concerns (oily, dry, dandruff, etc.)
+        │
+        ▼
+[Analysis Node]
+  Classify each ingredient:
+  ✅ Beneficial for your hair type
+  ⚠️  Neutral
+  ❌ Harmful / avoid
+        │
+        ▼
+[Structured Output Node]
+  Pydantic model → clean JSON → rendered in UI
+        │
+        ▼
+[Memory / Chat Node]
+  Store session, allow follow-up questions
