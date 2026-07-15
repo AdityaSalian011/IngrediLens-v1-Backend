@@ -9,7 +9,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_tavily import TavilySearch
 from langchain_core.documents import Document
 
-from typing import TypedDict, List, Annotated
+from typing import TypedDict, List, Annotated, Literal, Optional
 from pydantic import BaseModel, Field
 
 from dotenv import load_dotenv
@@ -36,8 +36,10 @@ llm = ChatOpenAI(
 # INGREDIENT STATE ================================================
 class IngredState(TypedDict):
 
-    textual_inp: str
-    # add img input in future
+    input_format: Literal['textual', 'image']
+    textual_inp: Optional[str]
+    image_inp: Optional[str]
+    image_mime_type: Optional[str]
     ingredients: List[str]
     analysis: str
 
@@ -52,7 +54,7 @@ class IngredSchema(BaseModel):
 extract_ingred_llm = llm.with_structured_output(IngredSchema)
 
 # NODE CREATION ===================================================
-def extract_ingred_node(state: IngredState) -> dict:
+def extract_textual_ingred_node(state: IngredState) -> dict:
     """A node, used to extract ONLY ingredients from user text."""
 
     response: IngredSchema = extract_ingred_llm.invoke([
@@ -67,6 +69,9 @@ def extract_ingred_node(state: IngredState) -> dict:
                 "Ignore marketing claims, descriptions, instructions, warnings, and product names.\n"
                 "Remove duplicates.\n"
                 "Return ONLY ingredient names.\n"
+                "If an ingredient is wrapped in [UNCLEAR: ...] or marked [ILLEGIBLE], "
+                "keep it in the list in that same marked form rather than silently "
+                "cleaning it up — downstream analysis needs to know it's uncertain.\n"
                 "If no ingredients are found, return an empty list.\n"
             )
         ),
@@ -78,6 +83,53 @@ def extract_ingred_node(state: IngredState) -> dict:
     return {
         'ingredients': response.ingredients
     }
+
+def extract_image_ingred_node(state: IngredState) -> dict:
+    """A node, used to extract ONLY ingredients from user provided image."""
+
+    message = HumanMessage(
+        content=[
+            {
+                'type': 'text',
+                'text': (
+                    "Extract and return ONLY the text visible in this image. "
+                    "Preserve line breaks and formatting where possible. "
+                    "Do not add commentary or explanation.\n\n"
+                    "IMPORTANT — accuracy over completeness:\n"
+                    "- If any word, ingredient name, or character is blurry, cut off, "
+                    "obscured, or ambiguous, DO NOT guess or auto-correct it based on "
+                    "what seems likely.\n"
+                    "- Instead, transcribe your best reading and wrap it like this: "
+                    "[UNCLEAR: your_best_guess].\n"
+                    "- If a word is fully illegible, write [ILLEGIBLE] in its place — "
+                    "do not omit it silently and do not invent a plausible-sounding "
+                    "ingredient name.\n"
+                    "- Never normalize, expand, or 'fix' a chemical/ingredient name to "
+                    "match a name you recognize — transcribe exactly what is printed, "
+                    "even if it looks like a misspelling."
+                )
+            },
+            {
+                'type': 'image',
+                'source_type': 'base64',
+                'data': state['image_inp'],
+                'mime_type': state['image_mime_type']
+            }
+        ]
+    )
+
+    response = llm.invoke([message])
+
+    return {
+        'textual_inp': response.content
+    }
+
+def route_on_input_format(state: IngredState) -> str:
+
+    if state['input_format'] == 'image':
+        return 'image_inp'
+    else:
+        return 'textual_inp'
 
 def analysis_node(state: IngredState, config: RunnableConfig, store: BaseStore) -> dict:
     """A node, used to generate concise analysis based on the extracted ingredients."""
@@ -128,11 +180,20 @@ extract_ingred_graph = StateGraph(IngredState)
 # add a conditional node here
 # on route_input_type()
 
-extract_ingred_graph.add_node('extract_ingred', extract_ingred_node)
+extract_ingred_graph.add_node('extract_textual_ingred', extract_textual_ingred_node)
+extract_ingred_graph.add_node('extract_image_ingred', extract_image_ingred_node)
 extract_ingred_graph.add_node('analysis', analysis_node)
 
-extract_ingred_graph.add_edge(START, 'extract_ingred')
-extract_ingred_graph.add_edge('extract_ingred', 'analysis')
+extract_ingred_graph.add_conditional_edges(
+    START, 
+    route_on_input_format,
+    {
+        'image_inp': 'extract_image_ingred',
+        'textual_inp': 'extract_textual_ingred'
+    }
+)
+extract_ingred_graph.add_edge('extract_image_ingred', 'extract_textual_ingred')
+extract_ingred_graph.add_edge('extract_textual_ingred', 'analysis')
 extract_ingred_graph.add_edge('analysis', END)
 
 # =================================================================
@@ -561,34 +622,15 @@ chatbot_graph.add_conditional_edges(
 chatbot_graph.add_edge('summary', END)
 
 if __name__ == '__main__':
-    from langgraph.checkpoint.postgres import PostgresSaver
-    from langgraph.store.postgres import PostgresStore
-    from psycopg_pool import ConnectionPool
-
-    DB_URI = "postgresql://postgres:postgres@localhost:5442/postgres?sslmode=disable"
-
-    pool = ConnectionPool(
-        conninfo=DB_URI,
-        kwargs={"autocommit": True},   # <-- add this
-    )
-
-    checkpointer = PostgresSaver(pool)
-    checkpointer.setup()
-
-    store = PostgresStore(pool)
-    store.setup()
 
     extract_ingred = extract_ingred_graph.compile()
 
-    chatbot = chatbot_graph.compile(
-        checkpointer=checkpointer,
-        store=store
-    )
+    chatbot = chatbot_graph.compile()
 
-    # # Step 1: user pastes a product's ingredient list
-    # ingred_result = extract_ingred.invoke({
-    #     'textual_inp': "Aqua, Sodium Laureth Sulfate, Honey, Parabens..."
-    # })
+    # Step 1: user pastes a product's ingredient list
+    ingred_result = extract_ingred.invoke({
+        'textual_inp': "Aqua, Sodium Laureth Sulfate, Honey, Parabens..."
+    })
 
     # Step 2: seed the chat thread with that output, alongside the first message
     result = chatbot.invoke(

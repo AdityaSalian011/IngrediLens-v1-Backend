@@ -11,7 +11,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.postgres.aio import AsyncPostgresStore
 from psycopg_pool import AsyncConnectionPool
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from contextlib import asynccontextmanager
@@ -29,6 +29,7 @@ import os
 import uuid
 import traceback
 import json
+import base64
 
 
 # ============================= FAST API INITIALIZATION =============================
@@ -71,13 +72,13 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://ingredi-lens-v1-frontend.vercel.app"],
+    allow_origins=["https://ingredi-lens-v1-frontend.vercel.app", "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 # ============================= REQUEST SCHEMA CREATION =============================
-class ScanRequest(BaseModel):
+class ScanTextRequest(BaseModel):
 
     text_input: str
 
@@ -122,10 +123,84 @@ async def logout(current_user: User = Depends(get_current_user)):
 async def get_me(current_user: User = Depends(get_current_user)):
     return current_user
 
+@app.post('/scan-image-ingredients')
+async def scan_image_ingredients(
+    image: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Scans user image and extracts ingredients from it,
+    Followed by an analysis/ summary on it."""
 
-@app.post('/scan-ingredients')
-async def scan_product_ingredients(
-    req: ScanRequest,
+    try:
+        raw_byte = await image.read()
+        encoded = base64.b64encode(raw_byte).decode(encoding='utf-8')
+        mime_type = image.content_type
+
+        # Step1: Extract ingredients
+        response = await extract_ingred.ainvoke(
+            {
+                'input_format': 'image',
+                'image_inp': encoded,
+                'image_mime_type': mime_type
+            },
+            config={'configurable': {'user_id': str(current_user.id)}}
+        )
+
+        # Fallback, if ingredients are not found
+        if not response.get('ingredients'):
+            raise HTTPException(
+                status_code=400,
+                detail="No ingredients found. Please provide product ingredients for analysis."
+            )
+        
+        # Step2: Unique thread id generation (each conv. will have a unique thread_id).
+        thread_id = str(uuid.uuid4())
+
+        # Step3 (IMP): Updates ChatbotState
+        # adds ingredient and analysis, so that STM saves it, and in future we do .invoke() without 
+        # ingredients and analysis
+        await  chatbot.aupdate_state(
+            config={'configurable': {'thread_id': thread_id}},
+            values={
+                'ingredients': response['ingredients'],
+                'analysis': response['analysis']
+            }
+        )
+
+        # Step4: Record ownership
+        ## Map thread_id's (conversation) to their respective users..
+        title = image.filename or 'Image scan'
+        scan = Scan(
+            thread_id=thread_id,
+            title=f"{title[:20]}..." if len(title) > 20 else title,
+            user_id=current_user.id
+        )
+        db.add(scan)
+        db.commit()
+
+        # Step5: Send data to frontend
+        return {
+            'thread_id': thread_id,
+            'ingredients': response['ingredients'],
+            'analysis': response['analysis']
+        }
+    
+    # Edge cases
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(tb)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Something went wrong.\n\nException:\n{e}"
+        )
+
+@app.post('/scan-textual-ingredients')
+async def scan_textual_ingredients(
+    req: ScanTextRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -135,7 +210,10 @@ async def scan_product_ingredients(
     try:
         # Step1: Extract ingredients
         response = await extract_ingred.ainvoke(
-            {'textual_inp': req.text_input},
+            {
+                'input_format': 'textual',
+                'textual_inp': req.text_input
+            },
             config={'configurable': {'user_id': str(current_user.id)}}
         )
 
