@@ -79,25 +79,37 @@ def extract_ingred_node(state: IngredState) -> dict:
         'ingredients': response.ingredients
     }
 
-def analysis_node(state: IngredState) -> dict:
+def analysis_node(state: IngredState, config: RunnableConfig, store: BaseStore) -> dict:
     """A node, used to generate concise analysis based on the extracted ingredients."""
 
     ingredients = '- ' + '\n- '.join(state['ingredients'])
+
+    user_id = config['configurable'].get('user_id', 'default_user')
+    user_details = ('users', user_id, 'details')
+
+    items = store.search(user_details)
+    user_details_content = '\n'.join(f"- {item.value['data']}" for item in items) if items else '(empty)'
+
     response = llm.invoke([
         SystemMessage(
             content=(
                 "You are a haircare ingredient analyst.\n"
+
+                "USER HAIR PROFILE:\n"
+                f"{user_details_content}\n"
+
                 "Analyze the ingredients and respond in this exact format:\n\n"
                 "Start with one sentence on the product's overall safety.\n"
                 "If any harmful or potentially toxic ingredients are present, list them with a ⚠️ and briefly explain why they are concerning.\n"
                 "If no harmful ingredients are found, say so in one sentence.\n"
-                "End with one sentence summarizing whether this product is worth using.\n\n"
+                "End with one sentence summarizing whether this product is worth using based on user's hair profile.\n\n"
                 "Rules:\n"
                 "- Maximum 6-7 lines total.\n"
                 "- Flag harmful ingredients clearly — this is the user's priority.\n"
                 "- Write in plain, conversational English.\n\n"
-                "You don't have the user's hair profile yet.\n"
-                "After your analysis, ask them once to share their hair type, texture and concerns "
+
+                "If user hair profile is empty or insufficient, \n"
+                "after your analysis, ask them once to share their hair type, texture and concerns "
                 "so future analyses can be personalized."
             )
         ),

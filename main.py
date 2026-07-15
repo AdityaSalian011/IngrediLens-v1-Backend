@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from pydantic import BaseModel
 
 from database import Base, engine, get_db
-from models import User
+from models import User, Scan
 from schemas import UserCreate, UserLogin, UserOut, Token
 from auth import hash_password, verify_password, create_access_token, get_current_user
 
@@ -53,7 +53,9 @@ async def lifespan(app: FastAPI):
     store = AsyncPostgresStore(pool)
     await store.setup()
 
-    extract_ingred = extract_ingred_graph.compile()
+    extract_ingred = extract_ingred_graph.compile(
+        store=store
+    )
 
     chatbot = chatbot_graph.compile(
         checkpointer=checkpointer,
@@ -69,7 +71,7 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://ingredi-lens-v1-frontend.vercel.app"],
+    allow_origins=["https://ingredi-lens-v1-frontend.vercel.app", "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -122,13 +124,20 @@ async def get_me(current_user: User = Depends(get_current_user)):
 
 
 @app.post('/scan-ingredients')
-async def scan_product_ingredients(req: ScanRequest):
+async def scan_product_ingredients(
+    req: ScanRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """Scans user text and extracts ingredients from it,
     Followed by an analysis/ summary on it."""
 
     try:
         # Step1: Extract ingredients
-        response = extract_ingred.invoke({'textual_inp': req.text_input})
+        response = await extract_ingred.ainvoke(
+            {'textual_inp': req.text_input},
+            config={'configurable': {'user_id': str(current_user.id)}}
+        )
 
         # Fallback, if ingredients are not found
         if not response.get('ingredients'):
@@ -151,7 +160,17 @@ async def scan_product_ingredients(req: ScanRequest):
             }
         )
 
-        # Step4: Send data to frontend
+        # Step4: Record ownership
+        ## Map thread_id's (conversation) to their respective users..
+        scan = Scan(
+            thread_id=thread_id,
+            title=f"{req.text_input[:20]}..." if len(req.text_input) > 20 else req.text_input,
+            user_id=current_user.id
+        )
+        db.add(scan)
+        db.commit()
+
+        # Step5: Send data to frontend
         return {
             'thread_id': thread_id,
             'ingredients': response['ingredients'],
@@ -244,12 +263,24 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user))
         )
     
 @app.get('/conv-history')
-async def get_conversation_history(thread_id: str):
+async def get_conversation_history(
+    thread_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """A path, to display conversation history between Human and AI.
     Requires thread_id to retrieve conversation snapshot from ChatbotState."""
     
     try:
-        # Step1: get thread-based State Snapshot
+        # Step1: Check if given thread_id exists in Scan
+        ## and if the thread_id belongs to the current user..
+        scan = db.query(Scan).filter(Scan.thread_id==thread_id).first()
+
+        if not scan or scan.user_id!=current_user.id:
+
+            raise HTTPException(status_code=404, detail='Conversation history not found.')
+        
+        # Step2: get thread-based State Snapshot
         snapshot = await chatbot.aget_state(
             config={'configurable': {'thread_id': thread_id}}
         )
@@ -261,7 +292,7 @@ async def get_conversation_history(thread_id: str):
                 detail='Conversation history not found.'
             )    
 
-        # Step2: Return previous analysis, along with conversations
+        # Step3: Return previous analysis, along with conversations
         return {
             'analysis': snapshot.values.get('analysis'),
             'messages': snapshot.values.get('full_history', [])
@@ -279,6 +310,23 @@ async def get_conversation_history(thread_id: str):
             detail=f"Something went wrong.\n\nException:\n{e}"
         )
     
+@app.get('/scans')
+async def list_scans(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    
+    scans = db.query(Scan).filter(
+        Scan.user_id==current_user.id
+    ).order_by(
+        Scan.created_at.desc()
+    ).all()
+
+    return [{
+        'thread_id': str(s.thread_id),
+        'title': s.title,
+        'date': s.created_at
+    } for s in scans]
 
 if __name__ == '__main__':
     import uvicorn
