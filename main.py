@@ -24,6 +24,7 @@ from schemas import UserCreate, UserLogin, UserOut, Token
 from auth import hash_password, verify_password, create_access_token, get_current_user
 
 from sqlalchemy.orm import Session
+from sqlalchemy import text    ## CRON JOB
 
 import os
 import uuid
@@ -89,6 +90,19 @@ class ChatRequest(BaseModel):
     deep_search: bool
 
 # ================================== PATH CREATION ==================================
+
+@app.get('/health')
+def health_check(db: Session = Depends(get_db)):
+    
+    try:
+        db.execute(text('SELECT 1'))
+        return {'status': 'ok', 'db': 'connected'}
+    
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(tb)
+        return {'status': 'ok', 'db': 'error', 'detail': str(e)}
+    
 
 @app.post('/auth/signup', response_model=UserOut, status_code=201)
 async def signup(req: UserCreate, db: Session = Depends(get_db)):
