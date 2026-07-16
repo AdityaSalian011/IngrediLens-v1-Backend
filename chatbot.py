@@ -76,7 +76,7 @@ def extract_textual_ingred_node(state: IngredState) -> dict:
             )
         ),
         HumanMessage(
-            content=state['textual_inp']
+            content=state.get('textual_inp')
         )
     ])
 
@@ -112,8 +112,8 @@ def extract_image_ingred_node(state: IngredState) -> dict:
             {
                 'type': 'image',
                 'source_type': 'base64',
-                'data': state['image_inp'],
-                'mime_type': state['image_mime_type']
+                'data': state.get('image_inp'),
+                'mime_type': state.get('image_mime_type')
             }
         ]
     )
@@ -126,7 +126,7 @@ def extract_image_ingred_node(state: IngredState) -> dict:
 
 def route_on_input_format(state: IngredState) -> str:
 
-    if state['input_format'] == 'image':
+    if state.get('input_format') == 'image':
         return 'image_inp'
     else:
         return 'textual_inp'
@@ -134,7 +134,7 @@ def route_on_input_format(state: IngredState) -> str:
 def analysis_node(state: IngredState, config: RunnableConfig, store: BaseStore) -> dict:
     """A node, used to generate concise analysis based on the extracted ingredients."""
 
-    ingredients = '- ' + '\n- '.join(state['ingredients'])
+    ingredients = '- ' + '\n- '.join(state.get('ingredients'))
 
     user_id = config['configurable'].get('user_id', 'default_user')
     user_details = ('users', user_id, 'details')
@@ -263,7 +263,7 @@ def remember_node(state: ChatState, config: RunnableConfig, store: BaseStore):
     system_prompt = MEMORY_PROMPT.format(user_details_content=user_details_content)
     # Note: We add previous user mems in system prompt to avoid duplication.
 
-    last_user_msg = state['messages'][-1].content
+    last_user_msg = state.get('messages')[-1].content
 
     decision: MemoryDecision = memory_extractor.invoke(
         [
@@ -295,7 +295,7 @@ query_rewriter_llm = llm.with_structured_output(WebQuerySchema)
 def rewrite_query_node(state: ChatState) -> dict:
     """A node, used to rewrite the user's latest message into a search-engine-friendly query."""
  
-    last_user_msg = state['messages'][-1].content
+    last_user_msg = state.get('messages')[-1].content
  
     result: WebQuerySchema = query_rewriter_llm.invoke([
         SystemMessage(
@@ -321,7 +321,7 @@ def tavily_search_node(state: ChatState) -> str:
     """A node, used to perform tavily search on the provided query,
     and extracts content from the searched web page."""
 
-    results = tavily_search.invoke({'query': state['research_query']})
+    results = tavily_search.invoke({'query': state.get('research_query')})
 
     research_context = []
     for r in results.get('results', []):
@@ -370,11 +370,11 @@ filter_chain = filter_prompt | llm.with_structured_output(KeepOrDrop)
 def refine_node(state: ChatState) -> dict:
     """A node, used to extract only meaningful content from research_context."""
 
-    context = "\n\n".join(d.page_content for d in state['research_context']).strip()
+    context = "\n\n".join(d.page_content for d in state.get('research_context')).strip()
 
     strips = decompose_to_sentences(context)
 
-    questions = [{"question": state['messages'][-1].content, "sentence": s} for s in strips]
+    questions = [{"question": state.get('messages')[-1].content, "sentence": s} for s in strips]
     results = filter_chain.batch(questions, return_exceptions=True)
     kept = [s for s, r in zip(strips, results) if not isinstance(r, Exception) and r.keep]
 
@@ -424,17 +424,17 @@ def deep_search_node(state: ChatState, config: RunnableConfig, store: BaseStore)
 
     # Step2: fetch conversation summary (if available), same as chat_node
     summary_section = (
-        f"CONVERSATION SUMMARY:\n{state['summary']}"
+        f"CONVERSATION SUMMARY:\n{state.get('summary')}"
         if state.get('summary')
         else ""
     )
 
-    user_query = state['messages'][-1].content
+    user_query = state.get('messages')[-1].content
 
     # Step3: build system prompt
     system_msg = DEEP_SEARCH_PROMPT_TEMPLATE.format(
         user_query=user_query,
-        refined_context=state['refined_context'] or '(no relevant research found)',
+        refined_context=state.get('refined_context') or '(no relevant research found)',
         summary_section=summary_section,
         user_details_content=user_details_content
     )
@@ -442,7 +442,7 @@ def deep_search_node(state: ChatState, config: RunnableConfig, store: BaseStore)
     # Step4: invoke llm with system prompt + full message history (STM)
     response = llm.invoke([
         SystemMessage(content=system_msg),
-        *state['messages']
+        *state.get('messages')
     ])
 
     return {
@@ -490,17 +490,17 @@ def chat_node(state: ChatState, config: RunnableConfig, store: BaseStore) -> dic
     user_details_content = '\n'.join(f"- {item.value['data']}" for item in items) if items else '(empty)'
 
     # Step2: fetch analysis
-    analysis_section = f"PREVIOUS ANALYSIS:\n{state['analysis']}"
+    analysis_section = f"PREVIOUS ANALYSIS:\n{state.get('analysis')}"
 
     # Step3: fetch conversation summary (if available)
     summary_section = (
-        f"CONVERSATION SUMMARY:\n{state['summary']}"
+        f"CONVERSATION SUMMARY:\n{state.get('summary')}"
         if state.get('summary')
         else ""
     )
 
     # Step4: ingredients (extracted thru extract_ingred workflow)
-    ingredients = '- ' + '\n- '.join(state['ingredients'])
+    ingredients = '- ' + '\n- '.join(state.get('ingredients'))
 
     # Step5: create system prompt
     system_msg = SYSTEM_PROMPT_TEMPLATE.format(
@@ -514,12 +514,12 @@ def chat_node(state: ChatState, config: RunnableConfig, store: BaseStore) -> dic
     # (previous conversation between HUMAN & ASSISTANT)  <-- STM
     response = llm.invoke([ 
         SystemMessage(content=(system_msg)),
-        *state['messages']
+        *state.get('messages')
     ])
 
     return {
         'full_history': [
-            {'role': 'human', 'content': state['messages'][-1].content},
+            {'role': 'human', 'content': state.get('messages')[-1].content},
             {'role': 'ai', 'content': response.content}
         ],
         'messages': [response]
@@ -535,10 +535,10 @@ def route_to_research(state: ChatState) -> str:
 def summary_node(state: ChatState) -> dict:
     """Creates a conversation summary, if conversation history get's bigger."""
 
-    if len(state['messages']) <= 4:
+    if len(state.get('messages')) <= 10:
         return {}
 
-    msgs_to_summarize = state['messages'][:-4]
+    msgs_to_summarize = state.get('messages')[:-4]
 
     existing_summary = state.get('summary')
     if existing_summary:
@@ -567,7 +567,7 @@ def summary_node(state: ChatState) -> dict:
 
 def should_summarize(state: ChatState) -> str:
 
-    return len(state['messages']) > 4
+    return len(state.get('messages')) > 4
 
 # GRAPH CREATION + COMPILATION ====================================
 chatbot_graph = StateGraph(ChatState)
