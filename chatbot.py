@@ -2,7 +2,7 @@ from langgraph.graph import StateGraph, START, END, MessagesState
 from langchain_core.runnables import RunnableConfig
 from langgraph.store.base import BaseStore
 
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.messages import SystemMessage, HumanMessage, RemoveMessage
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -17,7 +17,7 @@ import os
 
 import operator
 import uuid
-import re
+import numpy as np
 
 
 load_dotenv()
@@ -25,6 +25,12 @@ load_dotenv()
 llm = ChatOpenAI(
     model='gpt-4o-mini',
     temperature=0,
+    api_key=os.getenv('AICREDITS_API_KEY'),
+    base_url='https://api.aicredits.in/v1'
+)
+
+embedding_model = OpenAIEmbeddings(
+    model="text-embedding-3-small",
     api_key=os.getenv('AICREDITS_API_KEY'),
     base_url='https://api.aicredits.in/v1'
 )
@@ -43,6 +49,7 @@ class IngredState(TypedDict):
     ingredients: List[str]
     analysis: str
 
+
 class IngredSchema(BaseModel):
     """A pydantic schema, used to generate a structured LLM output, consisting list of ingredients."""
 
@@ -52,6 +59,7 @@ class IngredSchema(BaseModel):
     )
 
 extract_ingred_llm = llm.with_structured_output(IngredSchema)
+
 
 # NODE CREATION ===================================================
 def extract_textual_ingred_node(state: IngredState) -> dict:
@@ -83,6 +91,7 @@ def extract_textual_ingred_node(state: IngredState) -> dict:
     return {
         'ingredients': response.ingredients
     }
+
 
 def extract_image_ingred_node(state: IngredState) -> dict:
     """A node, used to extract ONLY ingredients from user provided image."""
@@ -124,12 +133,14 @@ def extract_image_ingred_node(state: IngredState) -> dict:
         'textual_inp': response.content
     }
 
+
 def route_on_input_format(state: IngredState) -> str:
 
     if state.get('input_format') == 'image':
         return 'image_inp'
     else:
         return 'textual_inp'
+
 
 def analysis_node(state: IngredState, config: RunnableConfig, store: BaseStore) -> dict:
     """A node, used to generate concise analysis based on the extracted ingredients."""
@@ -174,6 +185,7 @@ def analysis_node(state: IngredState, config: RunnableConfig, store: BaseStore) 
         'analysis': response.content
     }
 
+
 # GRAPH CREATION + COMPILATION ====================================
 extract_ingred_graph = StateGraph(IngredState)
 
@@ -196,6 +208,7 @@ extract_ingred_graph.add_edge('extract_image_ingred', 'extract_textual_ingred')
 extract_ingred_graph.add_edge('extract_textual_ingred', 'analysis')
 extract_ingred_graph.add_edge('analysis', END)
 
+
 # =================================================================
 # PART 2 =====================
 # ==================== CHATBOT IMPLEMENTATION ====================
@@ -203,7 +216,7 @@ extract_ingred_graph.add_edge('analysis', END)
 # CHATBOT STATE ===================================================
 class ChatState(MessagesState):
 
-    ingredients: List[str]
+    ingredients: List[str] 
     analysis: str
     summary: str = None
     full_history: Annotated[List[dict], operator.add] = []    # only for displaying full
@@ -212,13 +225,15 @@ class ChatState(MessagesState):
     # deep search
     deep_search: bool = False
     research_query: str
-    research_context: List[Document] = []
-    refined_context: str
+    research_content: List[Document]
+    refined_content: List[Document]
+
 
 class MemoryItem(BaseModel):
 
     is_new: bool = Field(description='True if this memory is NEW and should be stored, False if duplicate/ already known.')
     text: str = Field(description='Atomic user memory as a short sentence.')
+
 
 class MemoryDecision(BaseModel):
 
@@ -226,6 +241,7 @@ class MemoryDecision(BaseModel):
     memories: List[MemoryItem] = Field(default_factory=list)
 
 memory_extractor = llm.with_structured_output(MemoryDecision)
+
 
 MEMORY_PROMPT = """You are responsible for maintaining accurate hair profile memory for a haircare assistant.
 
@@ -246,6 +262,7 @@ TASK:
 - Ignore questions, ingredient queries, and analysis requests — these are not memory-worthy.
 - If there is nothing hair-profile-worthy, return should_write=false and an empty list.
 """
+
 
 def remember_node(state: ChatState, config: RunnableConfig, store: BaseStore):
     """A node, used to store long-term user memory (e.g. user's hair texture, concerns etc.)."""
@@ -280,6 +297,7 @@ def remember_node(state: ChatState, config: RunnableConfig, store: BaseStore):
 
     return {}
 
+
 # =================================================================
 # DEEP SEARCH NODE ================================================
 class WebQuerySchema(BaseModel):
@@ -291,6 +309,7 @@ class WebQuerySchema(BaseModel):
     )
 
 query_rewriter_llm = llm.with_structured_output(WebQuerySchema)
+
 
 def rewrite_query_node(state: ChatState) -> dict:
     """A node, used to rewrite the user's latest message into a search-engine-friendly query."""
@@ -317,32 +336,24 @@ tavily_search = TavilySearch(
     search_depth='advanced'
 )
 
+
 def tavily_search_node(state: ChatState) -> str:
     """A node, used to perform tavily search on the provided query,
     and extracts content from the searched web page."""
 
     results = tavily_search.invoke({'query': state.get('research_query')})
 
-    research_context = []
+    research_content = []
     for r in results.get('results', []):
 
         title = r.get("title", "")
         url = r.get("url", "")
         content = r.get("content", "") or r.get("snippet", "")
         
-        text = f"TITLE: {title}\nURL: {url}\nCONTENT:\n{content}"
+        research_content.append(Document(page_content=content, metadata={"url": url, "title": title}))
 
-        research_context.append(Document(page_content=text, metadata={"url": url, "title": title}))
+    return {'research_content': research_content}
 
-    return {'research_context': research_context}
-
-# -----------------------------
-# Sentence-level DECOMPOSER
-# -----------------------------
-def decompose_to_sentences(text: str) -> List[str]:
-    text = re.sub(r"\s+", " ", text).strip()
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    return [s.strip() for s in sentences if len(s.strip()) > 20]
 
 # -----------------------------
 # FILTER (LLM judge)
@@ -355,44 +366,103 @@ filter_prompt = ChatPromptTemplate.from_messages(
         (
             "system",
             "You are a strict relevance filter.\n"
-            "Return keep=true only if the sentence directly helps answer the question.\n"
-            "Use ONLY the sentence. Output JSON only.",
+            "Return keep=true only if the provided context directly helps answer the question.\n"
+            "Use ONLY the context. Output JSON only.",
         ),
-        ("human", "Question: {question}\n\nSentence:\n{sentence}"),
+        ("human", "Question: {question}\nContext:\n{context}"),
     ]
 )
 
 filter_chain = filter_prompt | llm.with_structured_output(KeepOrDrop)
 
+
 # -----------------------------
 # REFINING (Decompose -> Filter -> Recompose)
 # -----------------------------
 def refine_node(state: ChatState) -> dict:
-    """A node, used to extract only meaningful content from research_context."""
+    """A node, used to extract only meaningful content from research_content."""
+    refined_content = []
+    last_user_msg = state.get("messages")[-1].content
 
-    context = "\n\n".join(d.page_content for d in state.get('research_context')).strip()
+    for doc in state.get("research_content", []):
+        chunks = [c.strip() for c in doc.page_content.split("[...]") if c.strip()]
+        ref_content = ""
 
-    strips = decompose_to_sentences(context)
+        for c in chunks:
+            response: KeepOrDrop = filter_chain.invoke({"question": last_user_msg, "context": c})
 
-    questions = [{"question": state.get('messages')[-1].content, "sentence": s} for s in strips]
-    results = filter_chain.batch(questions, return_exceptions=True)
-    kept = [s for s, r in zip(strips, results) if not isinstance(r, Exception) and r.keep]
+            if response.keep and c not in ref_content:
+                ref_content += f"{c}\n"
 
-    refined_context = "\n".join(kept).strip()
+        if ref_content.strip():
+            refined_content.append(Document(page_content=ref_content.strip(), metadata=doc.metadata))
 
-    return {
-        'refined_context': refined_context
-    }
+    return {"refined_content": refined_content}
 
-DEEP_SEARCH_PROMPT_TEMPLATE = """You are IngrediLens, an intelligent haircare ingredient assistant.
-The user asked a general haircare/ingredient question, and you have gathered live research
-to help answer it.
+
+TOP_K = 5
+
+def cosine_sim(a, b) -> float:
+    a, b = np.array(a), np.array(b)
+    return float(np.dot(a, b)/ (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
+
+
+def semantic_select_node(state: ChatState) -> dict:
+    """A node, to select top K most semantically similar 'refined_content' to the user's message. Limits no. of input content being passed."""
+
+    docs = state.get("refined_content", [])
+    if not docs:
+        return {"refined_content": []}
+
+    query = state.get("messages")[-1].content
+    query_vec = embedding_model.embed_query(query)
+    doc_vec = embedding_model.embed_documents([d.page_content for d in docs])
+
+    scored = [(cosine_sim(query_vec, v), d) for v, d in zip(doc_vec, docs)]
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    top_docs = [d for _, d in scored[:TOP_K]]
+    return {"refined_content": top_docs}
+
+
+def format_research_context(docs: List[Document]) -> str:
+    if not docs:
+        return '(no relevant research found)'
+
+    sections = []
+    for i, doc in enumerate(docs, 1):
+        title = doc.metadata.get('title', 'Untitled source')
+        url = doc.metadata.get('url', '')
+        sections.append(f"[{i}] {title}\n{doc.page_content}\nSource: {url}")
+
+    return "\n\n".join(sections)
+
+
+def build_product_section(state: ChatState) -> str:
+    """Builds the scanned-product context block, or a clear 'none scanned' notice if absent."""
+
+    ingredients = state.get('ingredients')
+    analysis = state.get('analysis')
+
+    if not ingredients:
+        return "(No product has been scanned in this conversation. Answer generally — do not assume any specific product or ingredients.)"
+
+    ingredients_block = '- ' + '\n- '.join(ingredients)
+    analysis_block = f"\n\nPREVIOUS ANALYSIS OF THIS PRODUCT:\n{analysis}" if analysis else ""
+
+    return f"SCANNED PRODUCT INGREDIENTS:\n{ingredients_block}{analysis_block}"
+
+
+DEEP_SEARCH_PROMPT_TEMPLATE = """You are IngrediLens, an intelligent haircare assistant.
+The user asked a haircare-related question, and you have gathered live web research to help answer it.
 
 USER QUESTION:
 {user_query}
 
 RESEARCH CONTEXT (from web search):
-{refined_context}
+{refined_content}
+
+{product_section}
 
 {summary_section}
 
@@ -400,17 +470,19 @@ USER HAIR PROFILE:
 {user_details_content}
 
 Your behavior:
-- Answer ONLY using the provided research context as your primary source — do not rely on outside knowledge.
+- Answer using the provided research context as your primary source for any external claims, studies, or findings — do not rely on outside knowledge beyond it.
+- If a scanned product's ingredients and previous analysis are available above, connect the research to that product where relevant — e.g. if the research discusses an ingredient the user's scanned product contains.
 - If the context is empty or insufficient to answer confidently, say so honestly rather than guessing.
 - If the user's hair profile is available, tailor the answer to their specific hair type, texture, and concerns.
 - If the hair profile is missing, answer generally and don't assume specifics — you may remind them once that sharing their hair profile would help personalize the answer.
 - Flag harmful or concerning effects clearly with ⚠️.
 - Keep responses concise and in plain conversational English — no long markdown sections.
 - Do not fabricate research findings, studies, or claims not present in the provided context.
-- If source/ url is available in RESEARCH CONTEXT, make sure to display it below the respective section.
+- If a source/url is available in RESEARCH CONTEXT, display it below the respective section.
 
 At the end of each response, suggest 2-3 relevant follow-up questions the user might want to ask next.
 """
+
 
 def deep_search_node(state: ChatState, config: RunnableConfig, store: BaseStore) -> dict:
     """A node, used to generate deep/ research-based answer for the user's query."""
@@ -422,7 +494,10 @@ def deep_search_node(state: ChatState, config: RunnableConfig, store: BaseStore)
     items = store.search(user_details)
     user_details_content = '\n'.join(f"- {item.value['data']}" for item in items) if items else '(empty)'
 
-    # Step2: fetch conversation summary (if available), same as chat_node
+    # Step2: Build product section
+    product_section = build_product_section(state)
+
+    # Step3: fetch conversation summary (if available), same as chat_node
     summary_section = (
         f"CONVERSATION SUMMARY:\n{state.get('summary')}"
         if state.get('summary')
@@ -431,15 +506,15 @@ def deep_search_node(state: ChatState, config: RunnableConfig, store: BaseStore)
 
     user_query = state.get('messages')[-1].content
 
-    # Step3: build system prompt
+    # Step4: build system prompt
     system_msg = DEEP_SEARCH_PROMPT_TEMPLATE.format(
         user_query=user_query,
-        refined_context=state.get('refined_context') or '(no relevant research found)',
-        summary_section=summary_section,
+        refined_content=format_research_context(state.get("refined_content")),
+        product_section=product_section,        summary_section=summary_section,
         user_details_content=user_details_content
     )
 
-    # Step4: invoke llm with system prompt + full message history (STM)
+    # Step5: invoke llm with system prompt + full message history (STM)
     response = llm.invoke([
         SystemMessage(content=system_msg),
         *state.get('messages')
@@ -453,13 +528,11 @@ def deep_search_node(state: ChatState, config: RunnableConfig, store: BaseStore)
         'messages': [response]
     }
 
-SYSTEM_PROMPT_TEMPLATE = """You are IngrediLens, an intelligent haircare ingredient assistant.
-You have been given a list of ingredients from a hair product the user wants analyzed.
 
-PRODUCT INGREDIENTS:
-{ingredients}
+SYSTEM_PROMPT_TEMPLATE = """You are IngrediLens, an intelligent haircare assistant.
+You help users with haircare questions in general — and, when they've scanned a specific product, with questions about that product's ingredients.
 
-{analysis_section}
+{product_section}
 
 {summary_section}
 
@@ -467,16 +540,18 @@ USER HAIR PROFILE:
 {user_details_content}
 
 Your behavior:
-- Answer the user's ingredient-related questions using the provided ingredient list as your primary context.
+- Answer the user's haircare question directly and conversationally.
+- If a scanned product's ingredients and analysis are available above, use them as your primary context for anything product-specific — treat the previous analysis as already established, don't recompute or contradict it.
+- If no product has been scanned, answer from general haircare knowledge — do not invent or assume a specific product's ingredients.
 - If the user's hair profile is available, tailor every response to their specific hair type, texture, and concerns.
-- If the hair profile is missing, remind the user once (not repeatedly) that sharing their hair type and concerns will help personalize your analysis.
-- Do no make up or assume user's hair profile if it is not available.
-- Flag harmful or concerning ingredients clearly with ⚠️.
+- If the hair profile is missing, remind the user once (not repeatedly) that sharing their hair type and concerns will help personalize your answers.
+- Do not make up or assume the user's hair profile if it is not available.
+- Whenever specific ingredients are discussed, flag harmful or concerning ones clearly with ⚠️.
 - Keep responses concise and in plain conversational English — no long markdown sections.
-- Do not make up ingredients or assume the product contains anything not in the provided list.
 
-At the end of each response, suggest 2-3 relevant follow-up questions the user might want to ask about these specific ingredients.
+At the end of each response, suggest 2-3 relevant follow-up questions the user might want to ask next.
 """
+
 
 def chat_node(state: ChatState, config: RunnableConfig, store: BaseStore) -> dict:
     """A node, used to generate response using LT & ST Memory."""
@@ -489,8 +564,8 @@ def chat_node(state: ChatState, config: RunnableConfig, store: BaseStore) -> dic
 
     user_details_content = '\n'.join(f"- {item.value['data']}" for item in items) if items else '(empty)'
 
-    # Step2: fetch analysis
-    analysis_section = f"PREVIOUS ANALYSIS:\n{state.get('analysis')}"
+    # Step2: build product section
+    product_section = build_product_section(state)
 
     # Step3: fetch conversation summary (if available)
     summary_section = (
@@ -499,18 +574,14 @@ def chat_node(state: ChatState, config: RunnableConfig, store: BaseStore) -> dic
         else ""
     )
 
-    # Step4: ingredients (extracted thru extract_ingred workflow)
-    ingredients = '- ' + '\n- '.join(state.get('ingredients'))
-
-    # Step5: create system prompt
+    # Step4: create system prompt
     system_msg = SYSTEM_PROMPT_TEMPLATE.format(
-        ingredients=ingredients,
-        analysis_section=analysis_section,
+        product_section=product_section,
         summary_section=summary_section,
         user_details_content=user_details_content
     )
 
-    # Step6: invoke llm with system prompt and messages
+    # Step5: invoke llm with system prompt and messages
     # (previous conversation between HUMAN & ASSISTANT)  <-- STM
     response = llm.invoke([ 
         SystemMessage(content=(system_msg)),
@@ -525,6 +596,7 @@ def chat_node(state: ChatState, config: RunnableConfig, store: BaseStore) -> dic
         'messages': [response]
     }
 
+
 def route_to_research(state: ChatState) -> str:
 
     if state.get('deep_search'):
@@ -532,24 +604,35 @@ def route_to_research(state: ChatState) -> str:
     else:
         return 'chat'
 
+
+MAX_CONVERSATION_LEN = 6
+MAX_SUMMARY_CHARS = 2000
+
 def summary_node(state: ChatState) -> dict:
     """Creates a conversation summary, if conversation history get's bigger."""
 
-    if len(state.get('messages')) <= 10:
+    if len(state.get('messages')) <= MAX_CONVERSATION_LEN:
         return {}
 
     msgs_to_summarize = state.get('messages')[:-4]
-
     existing_summary = state.get('summary')
-    if existing_summary:
 
+    if existing_summary and len(existing_summary) < MAX_SUMMARY_CHARS:
         summary_prompt = (
             f"Existing summary:\n{existing_summary}\n\n"
-            "Extend the summary using the new conversation."
+            "Extend the summary using the new conversation. Keep the total summary concise — "
+            "prioritize recent and still-relevant information over exhaustive detail."
         )
     
     else:
-        summary_prompt = "Summarize the conversation."
+        # Either no summary yet, or it's grown too large — force a compressed rewrite
+        # instead of appending further.
+        summary_prompt = (
+            f"Existing summary (condense this, don't just append):\n{existing_summary or ''}\n\n"
+            "Summarize the conversation concisely, in under 200 words, keeping only "
+            "information still relevant to future turns (hair profile facts, ongoing concerns, "
+            "product context)." if existing_summary else "Summarize the conversation concisely, in under 200 words."
+        )
 
     response = llm.invoke([
         SystemMessage(content=summary_prompt),
@@ -579,6 +662,7 @@ chatbot_graph.add_node('remember', remember_node)
 chatbot_graph.add_node('rewrite_query', rewrite_query_node)
 chatbot_graph.add_node('tavily_search', tavily_search_node)
 chatbot_graph.add_node('refine', refine_node)
+chatbot_graph.add_node("semantic_select", semantic_select_node)
 chatbot_graph.add_node('deep_search', deep_search_node)
 
 # regular chat node
@@ -599,7 +683,8 @@ chatbot_graph.add_conditional_edges(
 
 chatbot_graph.add_edge('rewrite_query', 'tavily_search')
 chatbot_graph.add_edge('tavily_search', 'refine')
-chatbot_graph.add_edge('refine', 'deep_search')
+chatbot_graph.add_edge('refine', 'semantic_select')
+chatbot_graph.add_edge("semantic_select", "deep_search")
 
 chatbot_graph.add_conditional_edges(
     'deep_search',
@@ -620,27 +705,3 @@ chatbot_graph.add_conditional_edges(
 )
 
 chatbot_graph.add_edge('summary', END)
-
-if __name__ == '__main__':
-
-    extract_ingred = extract_ingred_graph.compile()
-
-    chatbot = chatbot_graph.compile()
-
-    # Step 1: user pastes a product's ingredient list
-    ingred_result = extract_ingred.invoke({
-        'textual_inp': "Aqua, Sodium Laureth Sulfate, Honey, Parabens..."
-    })
-
-    # Step 2: seed the chat thread with that output, alongside the first message
-    result = chatbot.invoke(
-        {
-            'messages': [HumanMessage(content="What about eggs? Are they helpful for my scalps? Will they remove dandruff?")],
-            # 'ingredients': ingred_result['ingredients'],
-            # 'analysis': ingred_result['analysis'],
-            'deep_search': True
-        },
-        config={'configurable': {'thread_id': 'thread-1'}}
-    )   
-
-    print(result['messages'][-1].content)

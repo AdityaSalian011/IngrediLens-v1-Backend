@@ -4,10 +4,11 @@ langgraph-checkpoint-postgres
 langchain
 langchain-openai
 langchain-tavily
+langchain-text-splitters
 
 langsmith
 
-psycopg
+psycopg[binary]
 psycopg-pool
 
 python-dotenv
@@ -24,3 +25,5 @@ python-jose[cryptography]
 
 pydantic[email]
 python-multipart
+
+numpy

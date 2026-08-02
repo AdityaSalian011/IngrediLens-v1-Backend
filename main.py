@@ -1,9 +1,3 @@
-import asyncio
-import sys
-
-if sys.platform=='win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
 from chatbot import extract_ingred_graph, chatbot_graph
 from langchain_core.messages import HumanMessage
 
@@ -73,7 +67,7 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://ingredi-lens-v2-frontend.vercel.app"],
+    allow_origins=[os.getenv("FRONTEND_URL")],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
