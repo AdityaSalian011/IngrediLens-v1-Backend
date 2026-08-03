@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 from contextlib import asynccontextmanager
 
 from pydantic import BaseModel
+from typing import Optional
 
 from database import Base, engine, get_db
 from models import User, Scan
@@ -80,7 +81,7 @@ class ScanTextRequest(BaseModel):
 class ChatRequest(BaseModel):
 
     message: str
-    thread_id: str
+    thread_id: Optional[str] = None
     deep_search: bool
 
 # ================================== PATH CREATION ==================================
@@ -317,17 +318,52 @@ async def event_generator(req: ChatRequest, user_id: str):
         yield "data: [DONE]\n\n"
 
 @app.post('/chat')
-async def chat(req: ChatRequest, current_user: User = Depends(get_current_user)):
+async def chat(
+    req: ChatRequest, 
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """A path, to have conversation with AI.
     Expects a user message,
     thread_id for STM operations,
     user_id for LTM operations.
-    Returns a AI generated response to the frontend."""
+    Returns a AI generated response to the frontend.
     
+    thread_id is now OPTIONAL — a scan (image/text) is no longer required
+    before chatting. If thread_id is omitted, a brand-new conversation
+    (with no scanned product) is created here"""
+
     try:
+        if req.thread_id:
+            # Existing conversation — verify it actually belongs to this user.
+            # (Previously unchecked: anyone could pass any thread_id and
+            # continue someone else's conversation.)
+            scan = db.query(Scan).filter(Scan.thread_id==req.thread_id).first()
+            if not scan or scan.user_id != current_user.id:
+                raise HTTPException(status_code=404, detail='Conversation not found.')
+
+        else:
+            # New, scan-less conversation — mint a thread_id and record
+            # ownership now, exactly like the scan endpoints do. Without this,
+            # a chat-only thread never gets a Scan row, so it silently
+            # disappears from /scans and /conv-history always 404s on it.   
+            req.thread_id = str(uuid.uuid4())
+            title = f"{req.message[:20]}..." if len(req.message) > 20 else req.message
+
+            new_scan = Scan(thread_id=req.thread_id, title=title, user_id=current_user.id)
+            db.add(new_scan)
+            db.commit()
+
+        async def stream_with_thread_id():
+            # Send the (possibly newly-generated) thread_id first, so the
+            # frontend can pick it up for future messages/history lookups
+            # even when it didn't supply one.
+            yield f"data: {json.dumps({'thread_id': req.thread_id})}\n\n"
+            async for chunk in event_generator(req, user_id=str(current_user.id)):
+                yield chunk
 
         return StreamingResponse(
-            event_generator(req, user_id=str(current_user.id)),
+            stream_with_thread_id(),
             media_type='text/event-stream',
             headers={
                 'Cache-Control': 'no-cache',

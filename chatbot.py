@@ -151,27 +151,28 @@ def analysis_node(state: IngredState, config: RunnableConfig, store: BaseStore) 
     user_details = ('users', user_id, 'details')
 
     items = store.search(user_details)
-    user_details_content = '\n'.join(f"- {item.value['data']}" for item in items) if items else '(empty)'
+    user_details_content = format_user_memory(items)
 
     response = llm.invoke([
         SystemMessage(
             content=(
                 "You are a haircare ingredient analyst.\n"
 
-                "USER HAIR PROFILE:\n"
+                "USER MEMORY (hair profile, product preferences, and things to avoid):\n"
                 f"{user_details_content}\n"
 
                 "Analyze the ingredients and respond in this exact format:\n\n"
                 "Start with one sentence on the product's overall safety.\n"
                 "If any harmful or potentially toxic ingredients are present, list them with a ⚠️ and briefly explain why they are concerning.\n"
+                "If any ingredient or brand matches something in the user's MUST AVOID list, flag it explicitly as a personal conflict for this user — not just a general warning.\n"
                 "If no harmful ingredients are found, say so in one sentence.\n"
-                "End with one sentence summarizing whether this product is worth using based on user's hair profile.\n\n"
+                "End with one sentence summarizing whether this product is worth using based on the user's hair profile and preferences.\n\n"
                 "Rules:\n"
                 "- Maximum 6-7 lines total.\n"
                 "- Flag harmful ingredients clearly — this is the user's priority.\n"
                 "- Write in plain, conversational English.\n\n"
 
-                "If user hair profile is empty or insufficient, \n"
+                "If user memory is empty or insufficient, \n"
                 "after your analysis, ask them once to share their hair type, texture and concerns "
                 "so future analyses can be personalized."
             )
@@ -231,8 +232,28 @@ class ChatState(MessagesState):
 
 class MemoryItem(BaseModel):
 
-    is_new: bool = Field(description='True if this memory is NEW and should be stored, False if duplicate/ already known.')
-    text: str = Field(description='Atomic user memory as a short sentence.')
+    action: Literal['add', 'update', 'delete'] = Field(
+        description=(
+            "'add' for a genuinely new fact. 'update' when this fact replaces/revises "
+            "an existing memory (e.g. hair type changed from dry to normal). "
+            "'delete' when an existing memory is no longer true and nothing should replace it."
+        )
+    )
+    target_key: Optional[str] = Field(
+        default=None,
+        description=(
+            "Required for 'update' or 'delete': the exact key of the existing memory "
+            "(from CURRENT USER MEMORY) that this action applies to. Omit for 'add'."
+        )
+    )
+    category: Literal['hair_profile', 'product_preference', 'product_avoid'] = Field(
+        description=(
+            "hair_profile: hair type/texture/concerns. "
+            "product_preference: brands/products/ingredients the user likes or wants to use. "
+            "product_avoid: brands/products/ingredients the user must NOT use (allergies, doctor's advice, dislikes)."
+        )
+    )
+    text: str = Field(description="Atomic memory as a short sentence. For 'delete', still summarize what's being removed.")
 
 
 class MemoryDecision(BaseModel):
@@ -243,42 +264,64 @@ class MemoryDecision(BaseModel):
 memory_extractor = llm.with_structured_output(MemoryDecision)
 
 
-MEMORY_PROMPT = """You are responsible for maintaining accurate hair profile memory for a haircare assistant.
+MEMORY_PROMPT = """You are responsible for maintaining accurate long-term memory for a haircare assistant.
 
-CURRENT USER HAIR PROFILE (existing memories):
+CURRENT USER MEMORY (existing memories, each with its key):
 {user_details_content}
 
 TASK:
-- Review the user's latest message.
-- Extract ONLY hair-related information worth storing long-term:
-    - Hair type (oily, dry, normal, combination)
-    - Hair texture (thick, thin, medium)
-    - Hair concerns (dandruff, hair fall, frizz, dryness, scalp sensitivity etc.)
-    - Products or ingredients they prefer to avoid
-- For each extracted item, set is_new=true ONLY if it adds NEW information not already in CURRENT USER HAIR PROFILE.
-- If it is basically the same meaning as something already present, set is_new=false.
-- Keep each memory as a short atomic sentence. (e.g. "User has oily scalp with dry ends.")
+Review the user's latest message and decide what long-term memory needs to change, across three categories:
+
+1. hair_profile — hair type (oily/dry/normal/combination), texture (thick/thin/medium), concerns
+   (dandruff, hair fall, frizz, dryness, scalp sensitivity, etc.)
+2. product_preference — brands, products, or ingredients the user likes or wants to use.
+3. product_avoid — brands, products, or ingredients the user must NOT use — allergies, a doctor's/
+   dermatologist's advice, or an explicit dislike (e.g. "avoid SLES", "my dermatologist told me to
+   stay away from brand X").
+
+For each fact you extract:
+- action='add' if it's genuinely new and doesn't conflict with anything in CURRENT USER MEMORY.
+- action='update' if it REVISES or CONTRADICTS an existing memory (e.g. the user previously said
+  "dry hair" and now says their hair is normal/softer now) — set target_key to that memory's exact key.
+- action='delete' if an existing memory is simply no longer true and nothing should replace it —
+  set target_key to that memory's exact key.
+- If the new statement is basically identical in meaning to an existing memory, do NOT emit anything
+  for it (no add, no update).
+
+Rules:
 - No speculation; only facts explicitly stated by the user.
-- Ignore questions, ingredient queries, and analysis requests — these are not memory-worthy.
-- If there is nothing hair-profile-worthy, return should_write=false and an empty list.
+- A single message often contains a fact AND a question/request in the same breath
+  (e.g. "my hair has gotten softer, can you recommend a product?"). Extract the
+  factual part even though the rest of the message is a question, ingredient query, or analysis request. Only return should_write=false when the message contains NO explicit fact at all — a pure question with nothing stated about the user.
+- Vague or relative descriptions of change count too, not just clean category labels — e.g. "my hair feels softer/drier/less greasy now" is a real revision to an existing hair_profile memory even though it isn't phrased as "oily/dry/normal." If it plausibly contradicts an existing memory, treat it as action='update' with that memory's key, and phrase the new memory descriptively in the user's own terms rather than forcing it into a fixed label.
+- Keep each memory as a short atomic sentence.
+- target_key must be copied exactly from CURRENT USER MEMORY — never invent a key.
+- If nothing is memory-worthy, return should_write=false and an empty list.
 """
 
 
 def remember_node(state: ChatState, config: RunnableConfig, store: BaseStore):
-    """A node, used to store long-term user memory (e.g. user's hair texture, concerns etc.)."""
+    """A node, used to store/update/remove long-term user memory
+    (hair profile, product preferences, and products/ingredients to avoid)."""
 
     # Step1: find user's memory location (namespace)
     user_id = config['configurable'].get('user_id', 'default_user')
     user_details = ('users', user_id, 'details')
 
-    # Step2: fetch all stored memory
+    # Step2: fetch all stored memory, keeping each item's key so the LLM can
+    # reference it for updates/deletes instead of only ever appending.
     existing_items = store.search(user_details)
-    existing_texts = [item.value.get('data', '') for item in existing_items if item.value.get('data')]
-    user_details_content = '\n'.join(f'- {text}' for text in existing_texts) if existing_texts else '(empty)'
+    if existing_items:
+        user_details_content = "\n".join(
+            f"[{item.key}] ({item.value.get('category', 'hair_profile')}) {item.value.get('data', '')}"
+            for item in existing_items
+            if item.value.get('data')
+        )
+    else:
+        user_details_content = "(empty)"
 
     # Step3: create a system prompt using those memory
     system_prompt = MEMORY_PROMPT.format(user_details_content=user_details_content)
-    # Note: We add previous user mems in system prompt to avoid duplication.
 
     last_user_msg = state.get('messages')[-1].content
 
@@ -289,11 +332,37 @@ def remember_node(state: ChatState, config: RunnableConfig, store: BaseStore):
         ]
     )
 
-    # Step4: Store worthy and new memories (non-duplicate) as an atomic text in user's memory location (namespace)
+    # Step4: apply add/update/delete decisions
+    existing_keys = [item.key for item in existing_items]
+
     if decision.should_write:
         for mem in decision.memories:
-            if mem.is_new:
-                store.put(user_details, str(uuid.uuid4()), {'data': mem.text})
+            
+            if mem.action == "add":
+                store.put(user_details, str(uuid.uuid4()), {
+                    "data": mem.text,
+                    "category": mem.category
+                })
+
+            elif mem.action == "update":
+                if mem.target_key and mem.target_key in existing_keys:
+                    # Overwrite the same key in place rather than delete+add,
+                    # so this stays a true "update" rather than accidental drift.
+                    store.put(user_details, mem.target_key, {
+                        "data": mem.text,
+                        "category": mem.category
+                    })
+
+                else:
+                    # fail-safe: store as new memory rather than silently dropping it.
+                    store.put(user_details, str(uuid.uuid4()), {
+                        "data": mem.text,
+                        "category": mem.category
+                    })
+
+            elif mem.action == "delete":
+                if mem.target_key and mem.target_key in existing_keys:
+                    store.delete(user_details, mem.target_key)
 
     return {}
 
@@ -438,6 +507,34 @@ def format_research_context(docs: List[Document]) -> str:
     return "\n\n".join(sections)
 
 
+def format_user_memory(items) -> str:
+    """Groups long-term memory items by category (hair_profile, product_preference,
+    product_avoid) into a readable, labeled block for prompts. Centralized here so
+    analysis_node, chat_node, and deep_search_node all present memory the same way,
+    rather than each re-implementing its own flat join."""
+
+    if not items:
+        return '(empty)'
+
+    grouped = {'hair_profile': [], 'product_preference': [], 'product_avoid': []}
+    for item in items:
+        data = item.value.get('data')
+        if not data:
+            continue
+        category = item.value.get('category', 'hair_profile')
+        grouped.setdefault(category, []).append(data)
+
+    sections = []
+    if grouped['hair_profile']:
+        sections.append("Hair profile:\n" + '\n'.join(f"- {t}" for t in grouped['hair_profile']))
+    if grouped['product_preference']:
+        sections.append("Product preferences:\n" + '\n'.join(f"- {t}" for t in grouped['product_preference']))
+    if grouped['product_avoid']:
+        sections.append("MUST AVOID — do not recommend or approve of these:\n" + '\n'.join(f"- {t}" for t in grouped['product_avoid']))
+
+    return '\n\n'.join(sections) if sections else '(empty)'
+
+
 def build_product_section(state: ChatState) -> str:
     """Builds the scanned-product context block, or a clear 'none scanned' notice if absent."""
 
@@ -466,7 +563,7 @@ RESEARCH CONTEXT (from web search):
 
 {summary_section}
 
-USER HAIR PROFILE:
+USER MEMORY (hair profile, product preferences, and things to avoid):
 {user_details_content}
 
 Your behavior:
@@ -475,6 +572,8 @@ Your behavior:
 - If the context is empty or insufficient to answer confidently, say so honestly rather than guessing.
 - If the user's hair profile is available, tailor the answer to their specific hair type, texture, and concerns.
 - If the hair profile is missing, answer generally and don't assume specifics — you may remind them once that sharing their hair profile would help personalize the answer.
+- If the user has stated product preferences, factor them into recommendations where relevant.
+- Treat anything in the user's MUST AVOID memory as a hard constraint: never recommend, endorse, or downplay concerns about those products, brands, or ingredients — proactively flag it if the research or discussion touches on something that conflicts with it.
 - Flag harmful or concerning effects clearly with ⚠️.
 - Keep responses concise and in plain conversational English — no long markdown sections.
 - Do not fabricate research findings, studies, or claims not present in the provided context.
@@ -492,12 +591,12 @@ def deep_search_node(state: ChatState, config: RunnableConfig, store: BaseStore)
     user_details = ('users', user_id, 'details')
 
     items = store.search(user_details)
-    user_details_content = '\n'.join(f"- {item.value['data']}" for item in items) if items else '(empty)'
+    user_details_content = format_user_memory(items)
 
     # Step2: Build product section
     product_section = build_product_section(state)
 
-    # Step3: fetch conversation summary (if available), same as chat_node
+    # Step3: fetch conversation summary (if available)
     summary_section = (
         f"CONVERSATION SUMMARY:\n{state.get('summary')}"
         if state.get('summary')
@@ -536,7 +635,7 @@ You help users with haircare questions in general — and, when they've scanned 
 
 {summary_section}
 
-USER HAIR PROFILE:
+USER MEMORY (hair profile, product preferences, and things to avoid):
 {user_details_content}
 
 Your behavior:
@@ -546,6 +645,8 @@ Your behavior:
 - If the user's hair profile is available, tailor every response to their specific hair type, texture, and concerns.
 - If the hair profile is missing, remind the user once (not repeatedly) that sharing their hair type and concerns will help personalize your answers.
 - Do not make up or assume the user's hair profile if it is not available.
+- If the user has stated product preferences, factor them into recommendations where relevant.
+- Treat anything in the user's MUST AVOID memory as a hard constraint: never recommend, endorse, or downplay concerns about those products, brands, or ingredients, even if asked generally — proactively flag it if a discussed product conflicts with it.
 - Whenever specific ingredients are discussed, flag harmful or concerning ones clearly with ⚠️.
 - Keep responses concise and in plain conversational English — no long markdown sections.
 
@@ -562,7 +663,7 @@ def chat_node(state: ChatState, config: RunnableConfig, store: BaseStore) -> dic
 
     items = store.search(user_details)
 
-    user_details_content = '\n'.join(f"- {item.value['data']}" for item in items) if items else '(empty)'
+    user_details_content = format_user_memory(items)
 
     # Step2: build product section
     product_section = build_product_section(state)
