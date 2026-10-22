@@ -4,6 +4,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.postgres.aio import AsyncPostgresStore
 from psycopg_pool import AsyncConnectionPool
+from psycopg.rows import dict_row
 
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,7 +40,11 @@ async def lifespan(app: FastAPI):
 
     pool = AsyncConnectionPool(
         conninfo=os.getenv('DB_URI'),
-        kwargs={'autocommit': True},
+        kwargs={
+            'autocommit': True,
+            'prepare_threshold': 0,
+            'row_factory': dict_row,
+        },
         open=False,
     )
     await pool.open()
